@@ -461,17 +461,21 @@ function whyText(r) {
 // and the radius of that place (m). 0 km means inside it.
 function nearestRef(lat, lon, songRow, places) {
   let best = null;
-  for (const [pi] of songRow[6]) {
+  for (const [pi, rc] of songRow[6]) {
     const p = places[pi];
     const scope = placeScope(p[2], p[5]);
     if (scope === "general") continue;               // "New York City" is too general
     const dc = haversineM(lat, lon, p[3], p[4]);
     if (scope === "broad" && dc > p[5]) continue;    // states, boroughs: only when inside
     const edge = Math.max(0, dc - p[5]);
-    if (best === null || edge < best.edge) best = { edge, radius: p[5], name: p[1] };
+    // Rank key: distance to the place's edge plus a quarter of its size, so a song about
+    // a spot 2 km away beats one about the whole state you're standing in.
+    const key = edge + 0.25 * p[5];
+    if (best === null || key < best.key) best = { edge, key, radius: p[5], name: p[1], rc };
   }
   // No usable place (only "New York City", or a state/country you're not in): never "near you".
-  return best === null ? { km: Infinity, radius: 0, name: "" } : { km: best.edge / 1000, radius: best.radius, name: best.name };
+  return best === null ? { km: Infinity, key: Infinity, radius: 0, name: "", rc: null }
+    : { km: best.edge / 1000, key: best.key, radius: best.radius, name: best.name, rc: best.rc };
 }
 // First unplayed entry among ranked radio() results (a little shuffle among the top few).
 function chooseUnplayed(ranked, played, rnd) {
@@ -530,43 +534,9 @@ function chooseUnplayed(ranked, played, rnd) {
 
   // Score every song for where you are right now (web/score.js, folk variant: the
   // nearer a place the song sings about, the higher it ranks), then take the best unplayed.
-  function pick() {
-    if (!here) return null;
-    const n = Math.min(400, played.size + 40);
-    const seed = Math.floor(Math.random() * 4294967296);
-    const ranked = radio(here.lat, here.lon, "neighborhood", n, data, seed);
-    const r = chooseUnplayed(ranked, played, Math.random);
-    if (!r) {  // nothing unplayed scores near you: the nearest unplayed song anywhere
-      let best = null;
-      for (const row of data.songs) {
-        if (played.has(row[0]) || !row[7]) continue;
-        const ref = nearestRef(here.lat, here.lon, row, data.places);
-        if (!ref.name) continue;
-        if (best === null || ref.km < best.ref.km) best = { row, ref };
-      }
-      if (!best) {  // every song has played this session: start over
-        if (!played.size) return null;
-        played.clear();
-        return pick();
-      }
-      played.add(best.row[0]);
-      sessionSet("folkradio.played", [...played]);
-      const a = data.artists.find((x) => x[0] === best.row[1]);
-      return { id: best.row[5] || "", title: best.row[2], artist: a ? a[1] : "", p: unpackPreview(best.row[7]),
-               a: unpackArt(best.row[8]), why: "sings about " + best.ref.name, km: best.ref.km, radius: best.ref.radius };
-    }
-    played.add(r.song.id);
-    sessionSet("folkradio.played", [...played]);
-    const row = rows.get(r.song.id);
-    const ref = nearestRef(here.lat, here.lon, row, data.places);
-    const why = whyText(r) || (ref.name ? "sings about " + ref.name : "");
-    return { id: row[5] || "", title: r.song.title, artist: r.song.artist || "", p: unpackPreview(row[7]),
-             a: unpackArt(row[8]), why, km: Number.isFinite(ref.km) ? ref.km : 0, radius: ref.radius };
-  }
-
-  // The 15 nearest songs to where you are, by the nearest place each sings about.
-  function renderNearby() {
-    if (!here || !data) return;
+  // Road-trip order (user, 2026-10-02): strictly the closest unplayed song; popularity only
+  // breaks ties within half a kilometre. No shuffling, so the list below is the play order.
+  function nearestOrder() {
     const list = [];
     for (const row of data.songs) {
       if (!row[7]) continue;
@@ -574,7 +544,33 @@ function chooseUnplayed(ranked, played, rnd) {
       if (!ref.name) continue;
       list.push({ row, ref });
     }
-    list.sort((a, b) => a.ref.km - b.ref.km);
+    list.sort((a, b) => (Math.round(a.ref.key / 500) - Math.round(b.ref.key / 500))
+                        || ((b.row[4] || 0) - (a.row[4] || 0)) || (a.ref.key - b.ref.key));
+    return list;
+  }
+
+  function pick() {
+    if (!here) return null;
+    let best = nearestOrder().find((x) => !played.has(x.row[0]));
+    if (!best && played.size) {  // everything has played this session: start over
+      played.clear();
+      best = nearestOrder()[0];
+    }
+    if (!best) return null;
+    const { row, ref } = best;
+    played.add(row[0]);
+    sessionSet("folkradio.played", [...played]);
+    const a = data.artists.find((x) => x[0] === row[1]);
+    const role = ref.rc != null && data.role_codes ? data.role_codes[ref.rc] : null;
+    return { id: row[5] || "", title: row[2], artist: a ? a[1] : "", p: unpackPreview(row[7]),
+             a: unpackArt(row[8]), why: `${ROLE_TEXT[role] || "sings about"} ${ref.name}`,
+             km: ref.km, radius: ref.radius };
+  }
+
+  // The 15 nearest songs to where you are, by the nearest place each sings about.
+  function renderNearby() {
+    if (!here || !data) return;
+    const list = nearestOrder();
     const ol = $("nearby");
     ol.textContent = "";
     for (const { row, ref } of list.slice(0, 15)) {
