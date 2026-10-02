@@ -470,7 +470,8 @@ function nearestRef(lat, lon, songRow, places) {
     const edge = Math.max(0, dc - p[5]);
     if (best === null || edge < best.edge) best = { edge, radius: p[5], name: p[1] };
   }
-  return best === null ? { km: 0, radius: 0, name: "" } : { km: best.edge / 1000, radius: best.radius, name: best.name };
+  // No usable place (only "New York City", or a state/country you're not in): never "near you".
+  return best === null ? { km: Infinity, radius: 0, name: "" } : { km: best.edge / 1000, radius: best.radius, name: best.name };
 }
 // First unplayed entry among ranked radio() results (a little shuffle among the top few).
 function chooseUnplayed(ranked, played, rnd) {
@@ -540,6 +541,7 @@ function chooseUnplayed(ranked, played, rnd) {
       for (const row of data.songs) {
         if (played.has(row[0]) || !row[7]) continue;
         const ref = nearestRef(here.lat, here.lon, row, data.places);
+        if (!ref.name) continue;
         if (best === null || ref.km < best.ref.km) best = { row, ref };
       }
       if (!best) {  // every song has played this session: start over
@@ -557,8 +559,9 @@ function chooseUnplayed(ranked, played, rnd) {
     sessionSet("folkradio.played", [...played]);
     const row = rows.get(r.song.id);
     const ref = nearestRef(here.lat, here.lon, row, data.places);
+    const why = whyText(r) || (ref.name ? "sings about " + ref.name : "");
     return { id: row[5] || "", title: r.song.title, artist: r.song.artist || "", p: unpackPreview(row[7]),
-             a: unpackArt(row[8]), why: whyText(r), km: ref.km, radius: ref.radius };
+             a: unpackArt(row[8]), why, km: Number.isFinite(ref.km) ? ref.km : 0, radius: ref.radius };
   }
 
   // The 15 nearest songs to where you are, by the nearest place each sings about.
