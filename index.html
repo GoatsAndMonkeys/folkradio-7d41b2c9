@@ -534,8 +534,8 @@ function chooseUnplayed(ranked, played, rnd) {
 
   // Score every song for where you are right now (web/score.js, folk variant: the
   // nearer a place the song sings about, the higher it ranks), then take the best unplayed.
-  // Road-trip order (user, 2026-10-02): strictly the closest unplayed song; popularity only
-  // breaks ties within half a kilometre. No shuffling, so the list below is the play order.
+  // Road-trip order (user, 2026-10-02): the best-scoring unplayed song, no shuffling, so the
+  // list below is the play order.
   function nearestOrder() {
     const list = [];
     for (const row of data.songs) {
@@ -544,8 +544,13 @@ function chooseUnplayed(ranked, played, rnd) {
       if (!ref.name) continue;
       list.push({ row, ref });
     }
-    list.sort((a, b) => (Math.round(a.ref.key / 500) - Math.round(b.ref.key / 500))
-                        || ((b.row[4] || 0) - (a.row[4] || 0)) || (a.ref.key - b.ref.key));
+    // score = (0.25 + 0.75 · popularity) / (d² + 2²), d in km (user, 2026-10-02): the closest
+    // song weighted by how popular / notable it is; distance squared so near wins.
+    for (const x of list) {
+      const dk = x.ref.key / 1000;
+      x.score = (0.25 + 0.75 * (x.row[4] == null ? 0.3 : x.row[4])) / (dk * dk + 4);
+    }
+    list.sort((a, b) => (b.score - a.score) || (a.ref.key - b.ref.key));
     return list;
   }
 
