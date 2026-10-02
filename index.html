@@ -91,17 +91,382 @@ button:focus-visible, .link:focus-visible { outline: 3px solid var(--amber); out
 
   <p class="status" id="status"></p>
   <p class="note">Prototype: Apple's free 30-second previews stand in for full songs. With MusicKit (an Apple Developer account) the same player plays whole tracks.
-    Keep this page open; when the phone is locked it keeps playing and uses your last known location. Place data © OpenStreetMap contributors.</p>
+    Songs are ranked on your phone from the places they sing about, anywhere in the world; the nearest ones come first. Keep this page open; when the phone is locked it keeps playing and uses your last known location. Place data © OpenStreetMap contributors.</p>
 </div>
 
 <audio id="audio" preload="auto" playsinline></audio>
 
 <script>
+// Client-side port of geo/scoring.py. Mirrors it function by function, with
+// the same constants; see that file's docstring for the formulas and choices.
+// Data is the JSON written by `geo export-web` (geo/stages/export_web.py).
+// Dependency-free ES module: `import { radio } from "./score.js"`.
+
+const EARTH_RADIUS_M = 6371008.8;
+const M_PER_DEG_LAT = EARTH_RADIUS_M * Math.PI / 180;
+
+const MIN_GEO = 0.05;
+const MIN_CANDIDATES = 30;
+const EXPAND_FACTOR = 1.5;
+const MAX_EXPANSIONS = 8;
+const CUTOFF_RADII = 3.0;
+const HOMETOWN_WEIGHT = 0.1;
+const HOMETOWN_RADIUS_M = 5000.0;
+const ORIGIN_ROLE = "artist_origin";  // why-entry role for "<artist> is from <origin>"
+// Folk station (user decision 2026-10-02): inverse-distance terms, see geo/scoring.py.
+// Data with data.scoring === "folk" uses scoreSongsFolk; any other data is scored as before.
+const FOLK_RADIUS_SCALE = 0.5;  // R = radius_m * this * zoom
+const FOLK_MIN_GEO = 0.0125;     // a song qualifies when its best ref term is at least this
+const SCORING_FOLK = "folk";
+const POP_FLOOR = 0.25;     // final multiplier at pop = 0; 1.0 at pop = 1
+const POP_DEFAULT = 0.3;    // used when popularity is null
+const ARTIST_CAP = 2;
+const CAP_WINDOW = 30;
+
+const rad = (deg) => deg * Math.PI / 180;
+
+function haversineM(lat1, lon1, lat2, lon2) {
+  const p1 = rad(lat1);
+  const p2 = rad(lat2);
+  const dp = p2 - p1;
+  const dl = rad(lon2 - lon1);
+  const h = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.sqrt(Math.min(1.0, h)));
+}
+
+const SPECIFICITY_REF_M = 2000.0;
+const SPECIFICITY_EXP = 0.75;
+const SPECIFICITY_MIN = 0.08;
+const SPECIFICITY_MAX = 2.5;
+
+function specificity(radiusM) {
+  if (!radiusM || radiusM <= 0) return 1.0;
+  const w = Math.pow(SPECIFICITY_REF_M / radiusM, SPECIFICITY_EXP);
+  return Math.min(SPECIFICITY_MAX, Math.max(SPECIFICITY_MIN, w));
+}
+
+function gauss(d, scale) {
+  const x = d / scale;
+  return Math.exp(-(x * x));
+}
+
+function popMultiplier(pop) {
+  const p = pop == null ? POP_DEFAULT : pop;
+  return POP_FLOOR + (1 - POP_FLOOR) * p;
+}
+
+function inBbox(lat, lon, plat, plon, reachM) {
+  const dlat = reachM / M_PER_DEG_LAT;
+  const dlon = dlat / Math.max(Math.cos(rad(plat)), 1e-6);
+  return Math.abs(lat - plat) <= dlat && Math.abs(lon - plon) <= dlon;  // no antimeridian in NYC
+}
+
+function tierOf(final) {
+  return Math.floor(Math.log2(final));
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), a | 1) >>> 0;
+    t = (((t + Math.imul(t ^ (t >>> 7), t | 61)) >>> 0) ^ t) >>> 0;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function shuffleInPlace(items, rng) {
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [items[i], items[j]] = [items[j], items[i]];
+  }
+}
+
+// Origin place indices, most specific first ([] if none).
+function artistOrigins(artist) {
+  if (artist === undefined || artist === null || artist.length < 5 || !artist[4] || !artist[4].length) return [];
+  return artist[4];
+}
+
+// [lat, lon, radius_m, origin name or null] for the hometown term, or null.
+function homePoint(artist, places) {
+  const origins = artistOrigins(artist);
+  if (origins.length) {
+    const p = places[origins[0]];
+    return [p[3], p[4], p[5], p[1]];
+  }
+  if (artist !== undefined && artist !== null && artist[2] != null && artist[3] != null) {
+    return [artist[2], artist[3], HOMETOWN_RADIUS_M, null];
+  }
+  return null;
+}
+
+// place_idx -> [distance_m, effective_radius_m] for places within the cutoff.
+const BROAD_TYPES = ["borough", "region"];
+const BROAD_RADIUS_M = 10000.0;
+const TOO_GENERAL_RADIUS_M = 20000.0;
+
+function placeScope(ptype, radiusM) {
+  if (ptype === "city" && radiusM >= TOO_GENERAL_RADIUS_M) return "general";
+  if (BROAD_TYPES.includes(ptype) || radiusM >= BROAD_RADIUS_M) return "broad";
+  return "specific";
+}
+
+function nearPlaces(lat, lon, places, mult, zoomMult = null) {
+  const out = new Map();
+  const zm = zoomMult === null || zoomMult === undefined ? mult : zoomMult;
+  places.forEach(([_pid, _name, ptype, plat, plon, radiusM], idx) => {
+    const scope = placeScope(ptype, radiusM);
+    if (scope === "general") return;
+    const r = radiusM * (scope === "broad" ? zm : mult);
+    const reach = scope === "broad" ? r : CUTOFF_RADII * r;
+    if (!inBbox(lat, lon, plat, plon, reach)) return;
+    const d = haversineM(lat, lon, plat, plon);
+    if (d <= reach) out.set(idx, [d, r]);
+  });
+  return out;
+}
+
+function folkRadius(radiusM, zoomMult) {
+  return Math.max(radiusM * FOLK_RADIUS_SCALE * zoomMult, 1.0);
+}
+
+// place_idx -> [distance_m, R] for places that can still give a ref term >= FOLK_MIN_GEO:
+// a term is at most specificity * R / (d + R), so beyond R * (specificity / min - 1) none can.
+function nearPlacesFolk(lat, lon, places, zoomMult) {
+  const out = new Map();
+  places.forEach(([_pid, _name, _ptype, plat, plon, radiusM], idx) => {
+    const k = specificity(radiusM);
+    if (k <= FOLK_MIN_GEO) return;
+    const r = folkRadius(radiusM, zoomMult);
+    const reach = r * (k / FOLK_MIN_GEO - 1.0);
+    if (!inBbox(lat, lon, plat, plon, reach)) return;
+    const d = haversineM(lat, lon, plat, plon);
+    if (d <= reach) out.set(idx, [d, r]);
+  });
+  return out;
+}
+
+// Folk variant of scoreSongs: ref term = conf * weight * specificity * R / (d + R).
+function scoreSongsFolk(lat, lon, zoomMult, data) {
+  const places = data.places;
+  const weights = data.roles;
+  const codes = data.role_codes;
+  const artists = new Map(data.artists.map((a) => [a[0], a]));
+  const near = nearPlacesFolk(lat, lon, places, zoomMult);
+  const out = [];
+  for (const song of data.songs) {
+    const [_sid, artistId, _title, _year, pop, _am, refs] = song;
+    let geo = 0.0;
+    let best = 0.0;
+    const why = [];
+    for (const [placeIdx, roleCode, conf] of refs) {
+      const hit = near.get(placeIdx);
+      if (hit === undefined) continue;
+      const [d, r] = hit;
+      const role = codes[roleCode];
+      const term = conf * weights[role] * specificity(places[placeIdx][5]) * r / (d + r);
+      geo += term;
+      if (term > best) best = term;
+      why.push([term, { place: places[placeIdx][1], role, distance_m: Math.round(d) }]);
+    }
+    if (best < FOLK_MIN_GEO) continue;
+    const artist = artists.get(artistId);
+    let originWhy = null;
+    const home = homePoint(artist, places);
+    if (home !== null) {
+      const [hlat, hlon, hr, originName] = home;
+      const dh = haversineM(lat, lon, hlat, hlon);
+      geo += HOMETOWN_WEIGHT * gauss(dh, hr * zoomMult);
+      if (originName !== null && dh <= hr * zoomMult) {
+        originWhy = { place: originName, role: ORIGIN_ROLE, distance_m: Math.round(dh) };
+      }
+    }
+    why.sort((x, y) => y[0] - x[0]);
+    const whys = why.map((w) => w[1]);
+    if (originWhy !== null) whys.push(originWhy);
+    out.push({ song, artist, geo, score: geo * popMultiplier(pop), why: whys });
+  }
+  out.sort((x, y) => (y.score - x.score) || (x.song[0] - y.song[0]));
+  return out;
+}
+
+// All candidates at effective multiplier `mult`, sorted by final desc, id asc.
+function scoreSongs(lat, lon, mult, data, zoomMult = null) {
+  const places = data.places;
+  const weights = data.roles;
+  const codes = data.role_codes;
+  const artists = new Map(data.artists.map((a) => [a[0], a]));
+  const near = nearPlaces(lat, lon, places, mult, zoomMult);
+  const out = [];
+  for (const song of data.songs) {
+    const [_sid, artistId, _title, _year, pop, _am, refs] = song;
+    let geo = 0.0;
+    let best = 0.0;
+    const why = [];
+    for (const [placeIdx, roleCode, conf] of refs) {
+      const hit = near.get(placeIdx);
+      if (hit === undefined) continue;
+      const [d, r] = hit;
+      const role = codes[roleCode];
+      const term = conf * weights[role] * gauss(d, r) * specificity(places[placeIdx][5]);
+      geo += term;
+      if (term > best) best = term;
+      why.push([term, { place: places[placeIdx][1], role, distance_m: Math.round(d) }]);
+    }
+    if (best < MIN_GEO) continue;
+    const artist = artists.get(artistId);
+    let originWhy = null;
+    const home = homePoint(artist, places);
+    if (home !== null) {
+      const [hlat, hlon, hr, originName] = home;
+      const dh = haversineM(lat, lon, hlat, hlon);
+      geo += HOMETOWN_WEIGHT * gauss(dh, hr * mult);
+      if (originName !== null && dh <= hr * mult) {
+        originWhy = { place: originName, role: ORIGIN_ROLE, distance_m: Math.round(dh) };
+      }
+    }
+    why.sort((x, y) => y[0] - x[0]);
+    const whys = why.map((w) => w[1]);
+    if (originWhy !== null) whys.push(originWhy);
+    out.push({ song, artist, geo, score: geo * popMultiplier(pop), why: whys });
+  }
+  out.sort((x, y) => (y.score - x.score) || (x.song[0] - y.song[0]));
+  return out;
+}
+
+// Expand radii until >= MIN_CANDIDATES. Returns [sorted candidates, expansion].
+function gather(lat, lon, zoom, data) {
+  const zm = data.zoom[zoom] ?? 1.0;
+  if (data.scoring === SCORING_FOLK) return [scoreSongsFolk(lat, lon, zm, data), 1.0];
+  let expand = 1.0;
+  let cands = scoreSongs(lat, lon, zm * expand, data, zm);
+  let k = 0;
+  while (cands.length < MIN_CANDIDATES && k < MAX_EXPANSIONS) {
+    k += 1;
+    expand *= EXPAND_FACTOR;
+    cands = scoreSongs(lat, lon, zm * expand, data, zm);
+  }
+  return [cands, expand];
+}
+
+// cands sorted by score desc -> same tiers in order, shuffled within each.
+function shuffleTiers(cands, rng) {
+  const out = [];
+  let i = 0;
+  while (i < cands.length) {
+    const t = tierOf(cands[i].score);
+    let j = i;
+    while (j < cands.length && tierOf(cands[j].score) === t) j += 1;
+    const block = cands.slice(i, j);
+    shuffleInPlace(block, rng);
+    out.push(...block);
+    i = j;
+  }
+  return out;
+}
+
+// At most ARTIST_CAP per artist in each CAP_WINDOW block; top up if short.
+function applyArtistCap(cands, n) {
+  let remaining = cands.slice();
+  const out = [];
+  while (remaining.length && out.length < n) {
+    const size = Math.min(CAP_WINDOW, n - out.length);
+    const counts = new Map();
+    const block = [];
+    const rest = [];
+    for (const c of remaining) {
+      const aid = c.song[1];
+      if (block.length < size && (counts.get(aid) ?? 0) < ARTIST_CAP) {
+        counts.set(aid, (counts.get(aid) ?? 0) + 1);
+        block.push(c);
+      } else {
+        rest.push(c);
+      }
+    }
+    while (block.length < size && rest.length) block.push(rest.shift());
+    out.push(...block);
+    remaining = rest;
+  }
+  return out;
+}
+
+function radio(lat, lon, zoom, n, data, seed = null) {
+  if (seed == null) seed = Math.floor(Math.random() * 2 ** 32);
+  const rng = mulberry32(seed);
+  const [cands, _expand] = gather(lat, lon, zoom, data);
+  const ranked = applyArtistCap(shuffleTiers(cands, rng), n);
+  const places = data.places;
+  return ranked.map((c) => {
+    const [sid, artistId, title, year, pop, amId, _refs] = c.song;
+    const artist = c.artist;
+    const origins = artistOrigins(artist);
+    return {
+      song: {
+        id: sid, title, year,
+        artist_id: artistId,
+        artist: artist !== undefined ? artist[1] : null,
+        origin: origins.length ? places[origins[0]][1] : null,
+        pop, apple_music_id: amId,
+      },
+      score: c.score,
+      geo: c.geo,
+      why: c.why,
+    };
+  });
+}
+
+
+// ---- folk player library (pure helpers; tests/test_folk_player.py runs these under a JS engine) ----
+// BEGIN folk-player-lib
+const PREVIEW_PREFIX = "https://audio-ssl.itunes.apple.com/itunes-assets/";
+function unpackPreview(s) {            // geo/stages/export_folk.py: pack_preview
+  if (!s) return "";
+  if (s.startsWith("http")) return s;
+  const [n, uuid, num] = s.split("|");
+  return `${PREVIEW_PREFIX}AudioPreview${n}/v4/${uuid.slice(0, 2)}/${uuid.slice(2, 4)}/${uuid.slice(4, 6)}/${uuid}/mzaf_${num}.plus.aac.p.m4a`;
+}
+function unpackArt(s) {                // geo/stages/export_folk.py: pack_art
+  if (!s) return "";
+  if (s.startsWith("http")) return s;
+  const [host, music, uuid, ...name] = s.split("|");
+  return `https://is${host}-ssl.mzstatic.com/image/thumb/${music}/v4/${uuid.slice(0, 2)}/${uuid.slice(2, 4)}/${uuid.slice(4, 6)}/${uuid}/${name.join("|")}/600x600bb.jpg`;
+}
+const ROLE_TEXT = { narrator_is_from: "reps", shoutout: "shouts out", setting: "set in", passing_mention: "mentions" };
+// One-line reason for a radio() result, like scripts/export_grid.py why_text.
+function whyText(r) {
+  const top = r.why.find((w) => w.role !== ORIGIN_ROLE);
+  const org = r.why.find((w) => w.role === ORIGIN_ROLE);
+  const origin = org ? `${r.song.artist || "The artist"} is from ${org.place}` : null;
+  if (!top) return origin || "";
+  const ref = `${ROLE_TEXT[top.role] || "mentions"} ${top.place}`;
+  if (origin === null) return ref;
+  return org.place === top.place ? origin : `${ref} · ${origin}`;
+}
+// Distance (km) from the listener to the nearest edge of a place the song sings about,
+// and the radius of that place (m). 0 km means inside it.
+function nearestRef(lat, lon, songRow, places) {
+  let best = null;
+  for (const [pi] of songRow[6]) {
+    const p = places[pi];
+    const edge = Math.max(0, haversineM(lat, lon, p[3], p[4]) - p[5]);
+    if (best === null || edge < best.edge) best = { edge, radius: p[5] };
+  }
+  return best === null ? { km: 0, radius: 0 } : { km: best.edge / 1000, radius: best.radius };
+}
+// First unplayed entry among ranked radio() results (a little shuffle among the top few).
+function chooseUnplayed(ranked, played, rnd) {
+  const pool = ranked.filter((r) => !played.has(r.song.id));
+  if (!pool.length) return null;
+  return pool[Math.floor(rnd() * Math.min(3, pool.length))];
+}
+// END folk-player-lib
+
 (function () {
-  const GRID_URL = "grid.json";
+  const DATA_URL = "grid.json";
   const $ = (id) => document.getElementById(id);
   const audio = $("audio");
-  let grid = null, here = null, current = null, started = false;
+  let data = null, rows = null, here = null, current = null, started = false;
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
@@ -139,59 +504,42 @@ button:focus-visible, .link:focus-visible { outline: 3px solid var(--amber); out
     { enableHighAccuracy: true, maximumAge: 30000, timeout: 20000 });
   }
 
-  // Songs played this session (this tab): no repeats until everything within reach has played.
+  // Songs played this session (this tab): no repeats until everything near you has played.
   const played = new Set(sessionGet("folkradio.played", []));
   function sessionGet(k, d) { try { const v = sessionStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
   function sessionSet(k, v) { try { sessionStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
-  const playable = (n) => !!grid.songs[n - 1].p;
 
-  // Nearest square (up to ~40 km out) that still has an unplayed song; ring by ring,
-  // nearest square first within a ring.
-  function findUnplayed(lat, lon) {
-    const i0 = Math.round(lat * grid.step), j0 = Math.round(lon * grid.step);
-    const kx = Math.cos(lat * Math.PI / 180);
-    for (let r = 0, R = Math.ceil(40 * grid.step / 111.2); r <= R; r++) {
-      const ring = [];
-      for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) {
-        if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
-        const cell = grid.cells[`${i0 + di}_${j0 + dj}`];
-        if (cell && cell.length) ring.push({ cell, km: Math.hypot(di, dj * kx) * 111.2 / grid.step });
-      }
-      ring.sort((a, b) => a.km - b.km);
-      for (const c of ring) {
-        const pool = c.cell.filter(([n]) => playable(n) && !played.has(n));
-        if (pool.length) return { pool, km: c.km };
-      }
-    }
-    return null;
-  }
-
+  // Score every song for where you are right now (web/score.js, folk variant: the
+  // nearer a place the song sings about, the higher it ranks), then take the best unplayed.
   function pick() {
     if (!here) return null;
-    let found = findUnplayed(here.lat, here.lon);
-    if (!found && played.size) {  // everything within reach has played: start over
+    const n = Math.min(400, played.size + 40);
+    const seed = Math.floor(Math.random() * 4294967296);
+    const ranked = radio(here.lat, here.lon, "neighborhood", n, data, seed);
+    let r = chooseUnplayed(ranked, played, Math.random);
+    if (!r && played.size) {  // everything near you has played: start over
       played.clear();
-      found = findUnplayed(here.lat, here.lon);
+      r = chooseUnplayed(ranked, played, Math.random);
     }
-    if (!found) return null;
-    const pool = found.pool;  // best-ranked first; a little shuffle among the top few
-    const [n, w] = pool[Math.floor(Math.random() * Math.min(3, pool.length))];
-    played.add(n);
+    if (!r) return null;
+    played.add(r.song.id);
     sessionSet("folkradio.played", [...played]);
-    return { ...grid.songs[n - 1], n, why: grid.whys[w - 1] || "", km: found.km };
+    const row = rows.get(r.song.id);
+    const ref = nearestRef(here.lat, here.lon, row, data.places);
+    return { id: row[5] || "", title: r.song.title, artist: r.song.artist || "", p: unpackPreview(row[7]),
+             a: unpackArt(row[8]), why: whyText(r), km: ref.km, radius: ref.radius };
   }
 
   function show(song) {
-    const [title, artist] = song.t.split(" · ");
-    $("title").textContent = title;
-    $("artist").textContent = artist || "";
+    $("title").textContent = song.title;
+    $("artist").textContent = song.artist;
     $("why").textContent = song.why ? song.why.charAt(0).toUpperCase() + song.why.slice(1) : "Near you";
     $("art").style.backgroundImage = song.a ? `url("${song.a}")` : "";
     const full = $("full");
     if (song.id) { full.href = `https://music.apple.com/us/song/${song.id}`; full.hidden = false; } else full.hidden = true;
     if ("mediaSession" in navigator) {
       navigator.mediaSession.metadata = new MediaMetadata({
-        title, artist: artist || "", album: "Folk Radio · " + (song.why || "near you"),
+        title: song.title, artist: song.artist, album: "Folk Radio · " + (song.why || "near you"),
         artwork: song.a ? [{ src: song.a, sizes: "600x600", type: "image/jpeg" }] : [],
       });
     }
@@ -202,11 +550,11 @@ button:focus-visible, .link:focus-visible { outline: 3px solid var(--amber); out
     await freshFix();
     if (!here) { status("No location yet. Allow location for Safari: Settings → Privacy → Location Services → Safari Websites → While Using.", true); $("start").hidden = false; return; }
     const song = pick();
-    if (!song) { status("No folk songs within 40 km of you yet. Folk Radio covers NYC, the Hudson Valley and Connecticut.", true); return; }
+    if (!song) { status("No folk songs about this area yet. Folk Radio knows places across the US and beyond, and the most songs near NYC, the Hudson Valley and Connecticut.", true); return; }
     current = song;
     show(song);
     audio.src = song.p;
-    try { await audio.play(); status(song.km > 0.4 ? `Nearest songs: ${song.km.toFixed(1)} km away` : "Song for your block"); }
+    try { await audio.play(); status(song.km > 0.4 ? `Nearest songs: ${song.km.toFixed(1)} km away` : (song.radius <= 1000 ? "Song for your block" : "Song for where you are")); }
     catch (e) { status("Tap Start to begin playback (" + e.name + ").", true); $("start").hidden = false; }
   }
 
@@ -230,9 +578,11 @@ button:focus-visible, .link:focus-visible { outline: 3px solid var(--amber); out
     if (!started) { audio.src = "data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA=="; audio.play().catch(() => {}); }
     status("Loading songs…");
     if (!started) { started = true; watchLocation(); }
-    if (!grid) {
-      try { grid = await (await fetch(GRID_URL, { cache: "no-cache" })).json(); }
-      catch (e) { status("Couldn't load the song list: " + e.message, true); $("start").hidden = false; return; }
+    if (!data) {
+      try {
+        data = await (await fetch(DATA_URL, { cache: "no-cache" })).json();
+        rows = new Map(data.songs.map((s) => [s[0], s]));
+      } catch (e) { status("Couldn't load the song list: " + e.message, true); $("start").hidden = false; return; }
     }
     try { navigator.wakeLock && navigator.wakeLock.request("screen").catch(() => {}); } catch (e) {}
     next();
