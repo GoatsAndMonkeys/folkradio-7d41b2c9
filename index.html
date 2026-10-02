@@ -232,14 +232,14 @@ function folkRadius(radiusM, zoomMult) {
 }
 
 // place_idx -> [distance_m, R] for places that can still give a ref term >= FOLK_MIN_GEO:
-// a term is at most specificity * R / (d + R), so beyond R * (specificity / min - 1) none can.
+// a term is at most specificity * R^2 / (d^2 + R^2), so beyond R * sqrt(specificity / min - 1) none can.
 function nearPlacesFolk(lat, lon, places, zoomMult) {
   const out = new Map();
   places.forEach(([_pid, _name, _ptype, plat, plon, radiusM], idx) => {
     const k = specificity(radiusM);
     if (k <= FOLK_MIN_GEO) return;
     const r = folkRadius(radiusM, zoomMult);
-    const reach = r * (k / FOLK_MIN_GEO - 1.0);
+    const reach = r * Math.sqrt(k / FOLK_MIN_GEO - 1.0);
     if (!inBbox(lat, lon, plat, plon, reach)) return;
     const d = haversineM(lat, lon, plat, plon);
     if (d <= reach) out.set(idx, [d, r]);
@@ -247,7 +247,7 @@ function nearPlacesFolk(lat, lon, places, zoomMult) {
   return out;
 }
 
-// Folk variant of scoreSongs: ref term = conf * weight * specificity * R / (d + R).
+// Folk variant of scoreSongs: ref term = conf * weight * specificity * R^2 / (d^2 + R^2).
 function scoreSongsFolk(lat, lon, zoomMult, data) {
   const places = data.places;
   const weights = data.roles;
@@ -265,7 +265,7 @@ function scoreSongsFolk(lat, lon, zoomMult, data) {
       if (hit === undefined) continue;
       const [d, r] = hit;
       const role = codes[roleCode];
-      const term = conf * weights[role] * specificity(places[placeIdx][5]) * r / (d + r);
+      const term = conf * weights[role] * specificity(places[placeIdx][5]) * r * r / (d * d + r * r);
       geo += term;
       if (term > best) best = term;
       why.push([term, { place: places[placeIdx][1], role, distance_m: Math.round(d) }]);
@@ -450,9 +450,9 @@ function nearestRef(lat, lon, songRow, places) {
   for (const [pi] of songRow[6]) {
     const p = places[pi];
     const edge = Math.max(0, haversineM(lat, lon, p[3], p[4]) - p[5]);
-    if (best === null || edge < best.edge) best = { edge, radius: p[5] };
+    if (best === null || edge < best.edge) best = { edge, radius: p[5], name: p[1] };
   }
-  return best === null ? { km: 0, radius: 0 } : { km: best.edge / 1000, radius: best.radius };
+  return best === null ? { km: 0, radius: 0, name: "" } : { km: best.edge / 1000, radius: best.radius, name: best.name };
 }
 // First unplayed entry among ranked radio() results (a little shuffle among the top few).
 function chooseUnplayed(ranked, played, rnd) {
@@ -516,12 +516,25 @@ function chooseUnplayed(ranked, played, rnd) {
     const n = Math.min(400, played.size + 40);
     const seed = Math.floor(Math.random() * 4294967296);
     const ranked = radio(here.lat, here.lon, "neighborhood", n, data, seed);
-    let r = chooseUnplayed(ranked, played, Math.random);
-    if (!r && played.size) {  // everything near you has played: start over
-      played.clear();
-      r = chooseUnplayed(ranked, played, Math.random);
+    const r = chooseUnplayed(ranked, played, Math.random);
+    if (!r) {  // nothing unplayed scores near you: the nearest unplayed song anywhere
+      let best = null;
+      for (const row of data.songs) {
+        if (played.has(row[0]) || !row[7]) continue;
+        const ref = nearestRef(here.lat, here.lon, row, data.places);
+        if (best === null || ref.km < best.ref.km) best = { row, ref };
+      }
+      if (!best) {  // every song has played this session: start over
+        if (!played.size) return null;
+        played.clear();
+        return pick();
+      }
+      played.add(best.row[0]);
+      sessionSet("folkradio.played", [...played]);
+      const a = data.artists.find((x) => x[0] === best.row[1]);
+      return { id: best.row[5] || "", title: best.row[2], artist: a ? a[1] : "", p: unpackPreview(best.row[7]),
+               a: unpackArt(best.row[8]), why: "sings about " + best.ref.name, km: best.ref.km, radius: best.ref.radius };
     }
-    if (!r) return null;
     played.add(r.song.id);
     sessionSet("folkradio.played", [...played]);
     const row = rows.get(r.song.id);
