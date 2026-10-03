@@ -225,6 +225,77 @@ function placeScope(ptype, radiusM) {
   return "specific";
 }
 
+// Lined places (rivers, long roads; user 2026-10-03: "Hudson River ... should be multiple points
+// along the long river"). In folk data a place MAY carry index 6 = list of polylines, each a flat
+// [lat0, lon0, lat1, lon1, ...], and index 7 = corridor radius in metres. For such a place the
+// distance is the distance to the nearest segment, its radius is the corridor and its scope is
+// "specific". Indices 0-5 keep the centroid/footprint for old clients. Folk path only.
+const LINE_CORRIDOR_M = 5000.0;
+
+// [lines, corridor_m] for a place with a non-empty line, else null.
+function placeGeom(place) {
+  if (place.length < 7) return null;
+  const lines = place[6];
+  if (!Array.isArray(lines) || !lines.length) return null;
+  const c = place.length > 7 ? place[7] : null;
+  return [lines, typeof c === "number" && c > 0 ? c : LINE_CORRIDOR_M];
+}
+
+// Min distance (m) from (lat, lon) to any segment of any polyline, in a local equirectangular
+// projection around the listener. A one-point polyline is a point; Infinity if there is none.
+function lineDistanceM(lat, lon, lines) {
+  const ky = M_PER_DEG_LAT;
+  const kx = Math.cos(rad(lat)) * M_PER_DEG_LAT;
+  let best2 = Infinity;
+  for (const pl of lines) {
+    const n = pl.length - (pl.length % 2);
+    if (n < 2) continue;
+    let ax = (pl[1] - lon) * kx;
+    let ay = (pl[0] - lat) * ky;
+    if (n === 2) best2 = Math.min(best2, ax * ax + ay * ay);
+    for (let i = 2; i < n; i += 2) {
+      const bx = (pl[i + 1] - lon) * kx;
+      const by = (pl[i] - lat) * ky;
+      const dx = bx - ax;
+      const dy = by - ay;
+      const len2 = dx * dx + dy * dy;
+      let t = len2 > 0 ? -(ax * dx + ay * dy) / len2 : 0;
+      t = t < 0 ? 0 : (t > 1 ? 1 : t);
+      const px = ax + t * dx;
+      const py = ay + t * dy;
+      const d2 = px * px + py * py;
+      if (d2 < best2) best2 = d2;
+      ax = bx;
+      ay = by;
+    }
+  }
+  return Math.sqrt(best2);
+}
+
+// Is (lat, lon) inside the lines' bbox expanded by reachM? (bbox prefilter, like inBbox)
+function lineInBbox(lat, lon, lines, reachM) {
+  let s = Infinity, n = -Infinity, w = Infinity, e = -Infinity;
+  for (const pl of lines) {
+    for (let i = 0; i + 1 < pl.length; i += 2) {
+      if (pl[i] < s) s = pl[i];
+      if (pl[i] > n) n = pl[i];
+      if (pl[i + 1] < w) w = pl[i + 1];
+      if (pl[i + 1] > e) e = pl[i + 1];
+    }
+  }
+  if (s > n) return false;
+  const dlat = reachM / M_PER_DEG_LAT;
+  const dlon = dlat / Math.max(Math.cos(rad(lat)), 1e-6);  // same x scale as lineDistanceM: never cuts a hit
+  return lat >= s - dlat && lat <= n + dlat && lon >= w - dlon && lon <= e + dlon;
+}
+
+// [distance_m, effective radius_m, scope] of a folk place: lined places use the line and the corridor.
+function placeDistanceFolk(lat, lon, place) {
+  const g = placeGeom(place);
+  if (g === null) return [haversineM(lat, lon, place[3], place[4]), place[5], placeScope(place[2], place[5])];
+  return [lineDistanceM(lat, lon, g[0]), g[1], "specific"];
+}
+
 function nearPlaces(lat, lon, places, mult, zoomMult = null) {
   const out = new Map();
   const zm = zoomMult === null || zoomMult === undefined ? mult : zoomMult;
@@ -244,21 +315,27 @@ function folkRadius(radiusM, zoomMult) {
   return Math.max(radiusM * FOLK_RADIUS_SCALE * zoomMult, 1.0);
 }
 
-// place_idx -> [distance_m, R] for places that can still give a ref term >= FOLK_MIN_GEO:
+// place_idx -> [distance_m, R, specificity] for places that can still give a ref term >= FOLK_MIN_GEO:
 // a term is at most specificity * R^2 / (d^2 + R^2), so beyond R * sqrt(specificity / min - 1) none can.
 function nearPlacesFolk(lat, lon, places, zoomMult) {
   const out = new Map();
-  places.forEach(([_pid, _name, ptype, plat, plon, radiusM], idx) => {
+  places.forEach((place, idx) => {
+    const [_pid, _name, ptype, plat, plon] = place;
+    const geom = placeGeom(place);
+    // A lined place (river, long road) is "specific" with the corridor as its radius.
+    const radiusM = geom === null ? place[5] : geom[1];
     // Same scope rule as hip-hop: "New York City" never counts; broad places only inside.
-    const scope = placeScope(ptype, radiusM);
+    const scope = geom === null ? placeScope(ptype, radiusM) : "specific";
     if (scope === "general") return;
     const k = specificity(radiusM);
     if (k <= FOLK_MIN_GEO) return;
     const r = folkRadius(radiusM, zoomMult);
     const reach = scope === "broad" ? radiusM * zoomMult : r * Math.sqrt(k / FOLK_MIN_GEO - 1.0);
-    if (!inBbox(lat, lon, plat, plon, reach)) return;
-    const d = haversineM(lat, lon, plat, plon);
-    if (d <= reach) out.set(idx, [d, r]);
+    if (geom === null) {
+      if (!inBbox(lat, lon, plat, plon, reach)) return;
+    } else if (!lineInBbox(lat, lon, geom[0], reach)) return;
+    const d = geom === null ? haversineM(lat, lon, plat, plon) : lineDistanceM(lat, lon, geom[0]);
+    if (d <= reach) out.set(idx, [d, r, k]);
   });
   return out;
 }
@@ -279,9 +356,9 @@ function scoreSongsFolk(lat, lon, zoomMult, data) {
     for (const [placeIdx, roleCode, conf] of refs) {
       const hit = near.get(placeIdx);
       if (hit === undefined) continue;
-      const [d, r] = hit;
+      const [d, r, k] = hit;
       const role = codes[roleCode];
-      const term = conf * weights[role] * specificity(places[placeIdx][5]) * r * r / (d * d + r * r);
+      const term = conf * weights[role] * k * r * r / (d * d + r * r);
       geo += term;
       if (term > best) best = term;
       why.push([term, { place: places[placeIdx][1], role, distance_m: Math.round(d) }]);
@@ -460,20 +537,21 @@ function whyText(r) {
   return org.place === top.place ? origin : `${ref} · ${origin}`;
 }
 // Distance (km) from the listener to the nearest edge of a place the song sings about,
-// and the radius of that place (m). 0 km means inside it.
+// and the radius of that place (m). 0 km means inside it. A lined place (river, long road:
+// index 6 of the place) is measured to its line, with its corridor as the radius, and is
+// always "specific" (score.js placeDistanceFolk).
 function nearestRef(lat, lon, songRow, places) {
   let best = null;
   for (const [pi, rc] of songRow[6]) {
     const p = places[pi];
-    const scope = placeScope(p[2], p[5]);
+    const [dc, radius, scope] = placeDistanceFolk(lat, lon, p);
     if (scope === "general") continue;               // "New York City" is too general
-    const dc = haversineM(lat, lon, p[3], p[4]);
-    if (scope === "broad" && dc > p[5]) continue;    // states, boroughs: only when inside
-    const edge = Math.max(0, dc - p[5]);
+    if (scope === "broad" && dc > radius) continue;  // states, boroughs: only when inside
+    const edge = Math.max(0, dc - radius);
     // Rank key: distance to the place's edge plus a quarter of its size, so a song about
     // a spot 2 km away beats one about the whole state you're standing in.
-    const key = edge + 0.25 * p[5];
-    if (best === null || key < best.key) best = { edge, key, radius: p[5], name: p[1], rc };
+    const key = edge + 0.25 * radius;
+    if (best === null || key < best.key) best = { edge, key, radius, name: p[1], rc };
   }
   // No usable place (only "New York City", or a state/country you're not in): never "near you".
   return best === null ? { km: Infinity, key: Infinity, radius: 0, name: "", rc: null }
