@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Folk Radio Pipeline</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
 :root {
   --bg: #f7f6f2; --card: #ffffff; --ink: #1f1d1a; --muted: #6d6860; --line: #e4e1da;
@@ -50,6 +52,10 @@ svg { width: 100%; height: auto; display: block; }
 .proj .k { color: var(--muted); font-size: 12px; }
 .proj .now { color: var(--muted); font-size: 12px; }
 .note { color: var(--muted); font-size: 12.5px; padding: 6px 0 12px; }
+#map { height: 440px; border-radius: 8px; margin: 6px 0 8px; z-index: 0; }
+.leaflet-popup-content { font-size: 13px; line-height: 1.4; }
+.leaflet-popup-content b { font-size: 14px; }
+.pop-list { margin: 4px 0 0; padding-left: 16px; }
 .stale { color: var(--accent2); font-weight: 600; }
 footer { color: var(--muted); font-size: 12px; }
 </style>
@@ -59,6 +65,8 @@ footer { color: var(--muted); font-size: 12px; }
   <h1>Folk radio pipeline</h1>
   <div class="sub" id="updated">Loading…</div>
   <div class="tiles" id="tiles"></div>
+  <div class="card"><h2>Map</h2><div id="map"></div>
+    <div class="note" id="mapnote">Each pin is a place named in a folk song; bigger pins have more songs. Tap a pin for the songs.</div></div>
   <div class="card" id="projcard"><h2>When the full run is done</h2><div id="proj"></div></div>
   <div class="card"><h2>Stages</h2><div id="stages"></div></div>
   <div class="card"><h2>Progress over time</h2><div id="chart"></div>
@@ -115,6 +123,30 @@ function render(s) {
   document.getElementById("loops").innerHTML = Object.entries(s.loops).map(([k, on]) =>
     `<span><span class="dot ${on ? "on" : ""}"></span>${L[k] || k}: ${on ? "running" : "off"}</span>`).join("");
   chart(s.history || []);
+  drawMap(s.pins);
+}
+let map, layer, fitted = false;
+function drawMap(pins) {
+  if (!window.L || !pins) return;
+  if (!map) {
+    map = L.map("map", { worldCopyJump: true }).setView([41.4, -73.6], 7);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 18, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
+    layer = L.layerGroup().addTo(map);
+  }
+  layer.clearLayers();
+  const esc = t => String(t).replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+  const color = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2f6f5e";
+  for (const [lat, lon, name, type, n, songs] of pins) {
+    const more = n > songs.length ? `<div class="now">+ ${n - songs.length} more</div>` : "";
+    L.circleMarker([lat, lon], { radius: Math.min(4 + 2.2 * Math.sqrt(n), 18), color: "#fff", weight: 1,
+        fillColor: color, fillOpacity: 0.8 })
+      .bindPopup(`<b>${esc(name)}</b> <span class="now">${esc(type)} · ${n} song${n === 1 ? "" : "s"}</span>
+        <ul class="pop-list">${songs.map(([t, a]) => `<li>${esc(t)} — ${esc(a)}</li>`).join("")}</ul>${more}`)
+      .addTo(layer);
+  }
+  document.getElementById("mapnote").textContent = `${pins.length.toLocaleString()} places with songs. ` +
+    "Each pin is a place named in a folk song; bigger pins have more songs. Tap a pin for the songs. The map opens on the Danbury / Hudson Valley area; zoom out for the rest of the world.";
 }
 function chart(h) {
   const el = document.getElementById("chart");
