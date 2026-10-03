@@ -90,7 +90,7 @@ function render(s) {
   document.getElementById("updated").innerHTML = `Updated ${when}` +
     (ageMin > 25 ? ` · <span class="stale">no update for ${Math.round(ageMin)} min; the laptop may be asleep</span>` : "");
   const tiles = [["songs on the map", c.placed_songs], ["places", c.places], ["place references", c.refs],
-                 ["Danbury-area songs on the map", c.danbury_placed], ["with Apple Music", c.apple_matched]];
+                 ["with Apple Music", c.apple_matched]];
   document.getElementById("tiles").innerHTML = tiles.map(([k, v]) =>
     `<div class="tile"><div class="v">${fmt(v)}</div><div class="k">${k}</div></div>`).join("");
   const pj = s.projection;
