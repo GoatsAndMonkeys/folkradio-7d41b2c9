@@ -289,11 +289,137 @@ function lineInBbox(lat, lon, lines, reachM) {
   return lat >= s - dlat && lat <= n + dlat && lon >= w - dlon && lon <= e + dlon;
 }
 
-// [distance_m, effective radius_m, scope] of a folk place: lined places use the line and the corridor.
+// Shaped places (states, counties, parks; user 2026-10-03: "the state is only the center of the
+// state. But it should play the state songs all over the state"). In folk data a place MAY carry
+// index 8 = polygon rings, each a flat [lat0, lon0, lat1, lon1, ...] (rings implicitly closed);
+// then indices 6 and 7 are null unless it also has a line. A BROAD place with a shape counts only
+// when the listener is inside the polygon (even-odd rule over all rings together, so islands and
+// holes work), at distance 0; outside it does not count. Specific places, places with a line
+// (the line wins) and places without a shape keep the old rules. Folk path only.
+// Phone player ranking (nearestRef): a broad place you are inside ranks at key
+// BROAD_FALLBACK_M + 0.1 * size, size = the polygon's footprint (placeFootprintM, not the radius
+// clamped to 300 km, so a state always beats its country) or radius_m without a shape, so a specific song within ~50 km plays first, then the
+// smallest region you are in (county before state before country).
+const BROAD_FALLBACK_M = 50000.0;
+
+// Non-empty polygon rings of a place (index 8), else null. Rings with < 3 points are dropped.
+function placeShape(place) {
+  if (place.length < 9) return null;
+  const rings = place[8];
+  if (!Array.isArray(rings)) return null;
+  const ok = rings.filter((r) => Array.isArray(r) && r.length >= 6);
+  return ok.length ? ok : null;
+}
+
+// [south, north, west, east] of a list of flat rings (or polylines); null if there are no points.
+function ringsBbox(rings) {
+  let s = Infinity, n = -Infinity, w = Infinity, e = -Infinity;
+  for (const r of rings) {
+    for (let i = 0; i + 1 < r.length; i += 2) {
+      if (r[i] < s) s = r[i];
+      if (r[i] > n) n = r[i];
+      if (r[i + 1] < w) w = r[i + 1];
+      if (r[i + 1] > e) e = r[i + 1];
+    }
+  }
+  return s > n ? null : [s, n, w, e];
+}
+
+// Even-odd ray casting over all rings together, in the lat/lon plane (x = lon, y = lat), with a
+// bbox prefilter (bbox = ringsBbox(rings), or computed here when not given). No antimeridian.
+function pointInRings(lat, lon, rings, bbox = null) {
+  const b = bbox === null ? ringsBbox(rings) : bbox;
+  if (b === null || lat < b[0] || lat > b[1] || lon < b[2] || lon > b[3]) return false;
+  let inside = false;
+  for (const r of rings) {
+    const n = r.length - (r.length % 2);
+    if (n < 6) continue;
+    let yj = r[n - 2], xj = r[n - 1];
+    for (let i = 0; i < n; i += 2) {
+      const yi = r[i], xi = r[i + 1];
+      if ((yi > lat) !== (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) inside = !inside;
+      yj = yi;
+      xj = xi;
+    }
+  }
+  return inside;
+}
+
+// Area (m^2) of flat rings under the even-odd rule: a ring nested in an odd number of other rings
+// (tested with its first vertex) is a hole and is subtracted. Each ring's area is the shoelace
+// formula on a local equirectangular projection at the ring's mean latitude.
+function ringsAreaM2(rings) {
+  let total = 0;
+  rings.forEach((r, k) => {
+    const n = r.length - (r.length % 2);
+    if (n < 6) return;
+    let mlat = 0;
+    for (let i = 0; i < n; i += 2) mlat += r[i];
+    mlat /= n / 2;
+    const kx = Math.cos(rad(mlat)) * M_PER_DEG_LAT;
+    let a = 0;
+    let yj = r[n - 2] * M_PER_DEG_LAT, xj = r[n - 1] * kx;
+    for (let i = 0; i < n; i += 2) {
+      const yi = r[i] * M_PER_DEG_LAT, xi = r[i + 1] * kx;
+      a += xj * yi - xi * yj;
+      yj = yi;
+      xj = xi;
+    }
+    let depth = 0;
+    rings.forEach((o, m) => { if (m !== k && pointInRings(r[0], r[1], [o])) depth += 1; });
+    total += (depth % 2 === 0 ? 1 : -1) * Math.abs(a) / 2;
+  });
+  return Math.max(total, 0);
+}
+
+// Footprint (m) of a shaped place: radius of the circle with the polygon's area; null without a
+// shape (or with a zero-area one). Used for the broad-fallback rank key in the player.
+function placeFootprintM(place) {
+  const m = shapeMemo(place);
+  if (m.rings === null) return null;
+  if (m.footprint === undefined) {
+    const f = Math.sqrt(ringsAreaM2(m.rings) / Math.PI);
+    m.footprint = f > 0 ? f : null;
+  }
+  return m.footprint;
+}
+
+// Per-place memo (rings, bbox, footprint, last query) so the player's per-song loop parses and tests each
+// polygon once per fix. Keyed by the place row (place rows are never mutated after loading).
+const SHAPE_MEMO = new WeakMap();
+function shapeMemo(place) {
+  let m = SHAPE_MEMO.get(place);
+  if (m === undefined) {
+    const rings = placeShape(place);
+    m = { rings, bbox: rings === null ? null : ringsBbox(rings), lat: NaN, lon: NaN, inside: false };
+    SHAPE_MEMO.set(place, m);
+  }
+  return m;
+}
+
+// true/false for a place with a shape (inside its polygon?), null for a place without one.
+function insidePlaceShape(lat, lon, place) {
+  const m = shapeMemo(place);
+  if (m.rings === null) return null;
+  if (m.lat !== lat || m.lon !== lon) {
+    m.inside = pointInRings(lat, lon, m.rings, m.bbox);
+    m.lat = lat;
+    m.lon = lon;
+  }
+  return m.inside;
+}
+
+// [distance_m, effective radius_m, scope] of a folk place: lined places use the line and the
+// corridor; a broad shaped place is at 0 when you are inside its polygon, else at Infinity.
 function placeDistanceFolk(lat, lon, place) {
   const g = placeGeom(place);
-  if (g === null) return [haversineM(lat, lon, place[3], place[4]), place[5], placeScope(place[2], place[5])];
-  return [lineDistanceM(lat, lon, g[0]), g[1], "specific"];
+  if (g !== null) return [lineDistanceM(lat, lon, g[0]), g[1], "specific"];
+  const scope = placeScope(place[2], place[5]);
+  if (scope === "broad") {
+    const inside = insidePlaceShape(lat, lon, place);
+    if (inside !== null) return [inside ? 0 : Infinity, place[5], scope];
+  }
+  return [haversineM(lat, lon, place[3], place[4]), place[5], scope];
 }
 
 function nearPlaces(lat, lon, places, mult, zoomMult = null) {
@@ -331,6 +457,14 @@ function nearPlacesFolk(lat, lon, places, zoomMult) {
     if (k <= FOLK_MIN_GEO) return;
     const r = folkRadius(radiusM, zoomMult);
     const reach = scope === "broad" ? radiusM * zoomMult : r * Math.sqrt(k / FOLK_MIN_GEO - 1.0);
+    if (geom === null && scope === "broad") {
+      // A broad place with a polygon (index 8) counts only inside it, at distance 0.
+      const inside = insidePlaceShape(lat, lon, place);
+      if (inside !== null) {
+        if (inside) out.set(idx, [0.0, r, k]);
+        return;
+      }
+    }
     if (geom === null) {
       if (!inBbox(lat, lon, plat, plon, reach)) return;
     } else if (!lineInBbox(lat, lon, geom[0], reach)) return;
@@ -539,7 +673,8 @@ function whyText(r) {
 // Distance (km) from the listener to the nearest edge of a place the song sings about,
 // and the radius of that place (m). 0 km means inside it. A lined place (river, long road:
 // index 6 of the place) is measured to its line, with its corridor as the radius, and is
-// always "specific" (score.js placeDistanceFolk).
+// always "specific"; a broad place with a polygon (index 8: states, counties) counts only
+// inside the polygon (score.js placeDistanceFolk).
 function nearestRef(lat, lon, songRow, places) {
   let best = null;
   for (const [pi, rc] of songRow[6]) {
@@ -548,14 +683,26 @@ function nearestRef(lat, lon, songRow, places) {
     if (scope === "general") continue;               // "New York City" is too general
     if (scope === "broad" && dc > radius) continue;  // states, boroughs: only when inside
     const edge = Math.max(0, dc - radius);
-    // Rank key: distance to the place's edge plus a quarter of its size, so a song about
-    // a spot 2 km away beats one about the whole state you're standing in.
-    const key = edge + 0.25 * radius;
-    if (best === null || key < best.key) best = { edge, key, radius, name: p[1], rc };
+    const broad = scope === "broad";
+    // Rank key: for a specific place, the distance to its edge plus a quarter of its size, so a
+    // song about a spot 2 km away beats one about a bigger place 2 km away. A broad place you
+    // are inside is a fallback (user 2026-10-03: "prefer geographically specific songs; when there
+    // isn't one they can play the state song or the region song"): BROAD_FALLBACK_M (50 km) plus
+    // a tenth of its size, so specific songs within ~50 km come first, then the smallest region
+    // you are in (county before state before country). Size = the polygon's real footprint
+    // (placeFootprintM), else radius_m; radius_m is clamped at 300 km, the footprint is not.
+    const key = broad ? BROAD_FALLBACK_M + 0.1 * (placeFootprintM(p) ?? radius) : edge + 0.25 * radius;
+    if (best === null || key < best.key) best = { edge, key, radius, name: p[1], rc, broad };
   }
   // No usable place (only "New York City", or a state/country you're not in): never "near you".
-  return best === null ? { km: Infinity, key: Infinity, radius: 0, name: "", rc: null }
-    : { km: best.edge / 1000, key: best.key, radius: best.radius, name: best.name, rc: best.rc };
+  return best === null ? { km: Infinity, key: Infinity, radius: 0, name: "", rc: null, broad: false }
+    : { km: best.edge / 1000, key: best.key, radius: best.radius, name: best.name, rc: best.rc, broad: best.broad };
+}
+// Status line once a song plays: km away, or "for your block" / "for where you are" (a broad
+// place you are inside is always "where you are").
+function statusText(song) {
+  return song.km > 0.4 ? `Nearest songs: ${song.km.toFixed(1)} km away`
+    : (song.radius <= 1000 && !song.broad ? "Song for your block" : "Song for where you are");
 }
 // First unplayed entry among ranked radio() results (a little shuffle among the top few).
 function chooseUnplayed(ranked, played, rnd) {
@@ -649,7 +796,7 @@ function chooseUnplayed(ranked, played, rnd) {
     const role = ref.rc != null && data.role_codes ? data.role_codes[ref.rc] : null;
     return { id: row[5] || "", title: row[2], artist: a ? a[1] : "", p: unpackPreview(row[7]),
              a: unpackArt(row[8]), why: `${ROLE_TEXT[role] || "sings about"} ${ref.name}`,
-             km: ref.km, radius: ref.radius };
+             km: ref.km, radius: ref.radius, broad: ref.broad };
   }
 
   // The 15 nearest songs to where you are, by the nearest place each sings about.
@@ -701,7 +848,7 @@ function chooseUnplayed(ranked, played, rnd) {
       try { audio.pause(); await AM.play(song.id); status("Full song · Apple Music"); return; }
       catch (e) { status("Apple Music couldn't play this one; preview instead."); }
     } else if (globalThis.AM && AM.active) AM.stop();
-    try { await audio.play(); status(song.km > 0.4 ? `Nearest songs: ${song.km.toFixed(1)} km away` : (song.radius <= 1000 ? "Song for your block" : "Song for where you are")); }
+    try { await audio.play(); status(statusText(song)); }
     catch (e) { status("Tap Start to begin playback (" + e.name + ").", true); $("start").hidden = false; }
   }
 
