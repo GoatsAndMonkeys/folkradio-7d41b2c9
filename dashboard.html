@@ -88,7 +88,7 @@ function render(s) {
   const c = s.counts, r = s.per_hour || {}, ageMin = (Date.now() / 1000 - s.updated) / 60;
   const when = new Date(s.updated * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
   document.getElementById("updated").innerHTML = `Updated ${when}` +
-    (ageMin > 25 ? ` · <span class="stale">no update for ${Math.round(ageMin)} min; the laptop may be asleep</span>` : "");
+    (ageMin > 10 ? ` · <span class="stale">no update for ${Math.round(ageMin)} min; the laptop may be asleep</span>` : "");
   const tiles = [["songs on the map", c.placed_songs], ["places", c.places], ["place references", c.refs],
                  ["with Apple Music", c.apple_matched]];
   document.getElementById("tiles").innerHTML = tiles.map(([k, v]) =>
