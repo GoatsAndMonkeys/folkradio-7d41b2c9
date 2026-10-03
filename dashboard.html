@@ -45,6 +45,11 @@ h1 { font-size: 22px; margin: 0 0 2px; }
 svg { width: 100%; height: auto; display: block; }
 .legend { display: flex; gap: 16px; font-size: 12.5px; color: var(--muted); padding: 0 0 10px; }
 .sw { display: inline-block; width: 12px; height: 3px; vertical-align: middle; margin-right: 5px; border-radius: 2px; }
+.proj { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; padding: 6px 0 4px; }
+.proj .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.proj .k { color: var(--muted); font-size: 12px; }
+.proj .now { color: var(--muted); font-size: 12px; }
+.note { color: var(--muted); font-size: 12.5px; padding: 6px 0 12px; }
 .stale { color: var(--accent2); font-weight: 600; }
 footer { color: var(--muted); font-size: 12px; }
 </style>
@@ -54,6 +59,7 @@ footer { color: var(--muted); font-size: 12px; }
   <h1>Folk radio pipeline</h1>
   <div class="sub" id="updated">Loading…</div>
   <div class="tiles" id="tiles"></div>
+  <div class="card" id="projcard"><h2>When the full run is done</h2><div id="proj"></div></div>
   <div class="card"><h2>Stages</h2><div id="stages"></div></div>
   <div class="card"><h2>Progress over time</h2><div id="chart"></div>
     <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>songs extracted</span>
@@ -79,6 +85,17 @@ function render(s) {
                  ["Danbury-area songs on the map", c.danbury_placed], ["with Apple Music", c.apple_matched]];
   document.getElementById("tiles").innerHTML = tiles.map(([k, v]) =>
     `<div class="tile"><div class="v">${fmt(v)}</div><div class="k">${k}</div></div>`).join("");
+  const pj = s.projection;
+  document.getElementById("projcard").style.display = pj ? "" : "none";
+  if (pj) {
+    const items = [["songs on the map", pj.songs, c.placed_songs], ["place references", pj.refs, c.refs],
+                   ["places", pj.places, c.places]];
+    const left = pj.hours_left == null ? "" : ` in about ${eta(1, 1 / pj.hours_left)}`;
+    document.getElementById("proj").innerHTML = `<div class="proj">` + items.map(([k, v, now]) =>
+      `<div><div class="v">~${fmt(v)}</div><div class="k">${k}</div><div class="now">now ${fmt(now)}</div></div>`).join("") +
+      `</div><div class="note">Estimate${left}: ${fmt(pj.to_check)} songs still to check for lyrics, about ${fmt(pj.to_extract)} still to extract.
+       Based on the hit rates so far; not counting the Genius town search or new artists.</div>`;
+  }
   const st = s.stages, rows = [
     ["Discographies", "songs", c.artists_with_songs, c.artists_slice, `${fmt(c.songs)} songs from ${fmt(c.artists_with_songs)} artists`, "artists_with_songs"],
     ["Lyrics check", "lyrics", c.lyrics_checked, c.lyrics_target, `${fmt(c.lyrics_found)} have lyrics`, "lyrics_checked"],
