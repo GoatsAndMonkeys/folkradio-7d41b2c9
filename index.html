@@ -546,15 +546,61 @@ function scoreSongsFolk(lat, lon, zoomMult, data) {
   return out;
 }
 
+// Per-data memo for the phone player (national hip-hop, 2026-10-03): the artist map and, per
+// place index, the indices of the songs that reference it, so scoreSongs only visits songs with a
+// ref near the listener (any other song has best term 0 < MIN_GEO). Keyed by the songs array (never
+// mutated after loading). The result is identical to a loop over every song: candidates are
+// sorted by (score desc, id asc) and each song is visited once, in data order.
+const SONG_INDEX = new WeakMap();
+function songIndex(data) {
+  let m = SONG_INDEX.get(data.songs);
+  if (m === undefined) {
+    const byPlace = new Map();
+    data.songs.forEach((song, i) => {
+      for (const ref of song[6]) {
+        let l = byPlace.get(ref[0]);
+        if (l === undefined) byPlace.set(ref[0], (l = []));
+        if (l[l.length - 1] !== i) l.push(i);
+      }
+    });
+    m = { byPlace, artists: new Map(data.artists.map((a) => [a[0], a])) };
+    SONG_INDEX.set(data.songs, m);
+  }
+  return m;
+}
+
+// Song rows with a ref to any place in `near` (a Map keyed by place index), in data order.
+function songsNear(data, near) {
+  const { byPlace } = songIndex(data);
+  const songs = data.songs;
+  const mark = new Uint8Array(songs.length);
+  let lo = songs.length, hi = -1;
+  for (const idx of near.keys()) {
+    const l = byPlace.get(idx);
+    if (l === undefined) continue;
+    for (const i of l) {
+      mark[i] = 1;
+      if (i < lo) lo = i;
+      if (i > hi) hi = i;
+    }
+  }
+  const out = [];
+  for (let i = lo; i <= hi; i++) if (mark[i]) out.push(songs[i]);
+  return out;
+}
+
 // All candidates at effective multiplier `mult`, sorted by final desc, id asc.
-function scoreSongs(lat, lon, mult, data, zoomMult = null) {
+// keep: optional predicate over song rows; rejected songs are never candidates (the national
+// phone player passes "has a preview, not played yet, decade checked").
+function scoreSongs(lat, lon, mult, data, zoomMult = null, keep = null) {
   const places = data.places;
   const weights = data.roles;
   const codes = data.role_codes;
-  const artists = new Map(data.artists.map((a) => [a[0], a]));
+  const artists = songIndex(data).artists;
   const near = nearPlaces(lat, lon, places, mult, zoomMult);
   const out = [];
-  for (const song of data.songs) {
+  for (const song of songsNear(data, near)) {
+    if (keep !== null && !keep(song)) continue;
     const [_sid, artistId, _title, _year, pop, _am, refs] = song;
     let geo = 0.0;
     let best = 0.0;
@@ -591,16 +637,21 @@ function scoreSongs(lat, lon, mult, data, zoomMult = null) {
 }
 
 // Expand radii until >= MIN_CANDIDATES. Returns [sorted candidates, expansion].
-function gather(lat, lon, zoom, data) {
+// keep (optional song-row predicate): rejected songs are left out before the candidate count, so
+// the radius keeps growing past songs already played (national player).
+function gather(lat, lon, zoom, data, keep = null) {
   const zm = data.zoom[zoom] ?? 1.0;
-  if (data.scoring === SCORING_FOLK) return [scoreSongsFolk(lat, lon, zm, data), 1.0];
+  if (data.scoring === SCORING_FOLK) {
+    const c = scoreSongsFolk(lat, lon, zm, data);
+    return [keep === null ? c : c.filter((x) => keep(x.song)), 1.0];
+  }
   let expand = 1.0;
-  let cands = scoreSongs(lat, lon, zm * expand, data, zm);
+  let cands = scoreSongs(lat, lon, zm * expand, data, zm, keep);
   let k = 0;
   while (cands.length < MIN_CANDIDATES && k < MAX_EXPANSIONS) {
     k += 1;
     expand *= EXPAND_FACTOR;
-    cands = scoreSongs(lat, lon, zm * expand, data, zm);
+    cands = scoreSongs(lat, lon, zm * expand, data, zm, keep);
   }
   return [cands, expand];
 }
@@ -646,10 +697,10 @@ function applyArtistCap(cands, n) {
   return out;
 }
 
-function radio(lat, lon, zoom, n, data, seed = null) {
+function radio(lat, lon, zoom, n, data, seed = null, keep = null) {
   if (seed == null) seed = Math.floor(Math.random() * 2 ** 32);
   const rng = mulberry32(seed);
-  const [cands, _expand] = gather(lat, lon, zoom, data);
+  const [cands, _expand] = gather(lat, lon, zoom, data, keep);
   const ranked = applyArtistCap(shuffleTiers(cands, rng), n);
   const places = data.places;
   return ranked.map((c) => {
