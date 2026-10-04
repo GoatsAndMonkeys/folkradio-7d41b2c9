@@ -229,7 +229,8 @@ function placeScope(ptype, radiusM) {
 // along the long river"). In folk data a place MAY carry index 6 = list of polylines, each a flat
 // [lat0, lon0, lat1, lon1, ...], and index 7 = corridor radius in metres. For such a place the
 // distance is the distance to the nearest segment, its radius is the corridor and its scope is
-// "specific". Indices 0-5 keep the centroid/footprint for old clients. Folk path only.
+// "specific". Indices 0-5 keep the centroid/footprint for old clients. Both stations (hip-hop
+// since 2026-10-03).
 const LINE_CORRIDOR_M = 5000.0;
 
 // [lines, corridor_m] for a place with a non-empty line, else null.
@@ -295,7 +296,8 @@ function lineInBbox(lat, lon, lines, reachM) {
 // then indices 6 and 7 are null unless it also has a line. A BROAD place with a shape counts only
 // when the listener is inside the polygon (even-odd rule over all rings together, so islands and
 // holes work), at distance 0; outside it does not count. Specific places, places with a line
-// (the line wins) and places without a shape keep the old rules. Folk path only.
+// (the line wins) and places without a shape keep the old rules. Both stations (hip-hop since
+// 2026-10-03).
 // Phone player ranking (nearestRef): a broad place you are inside ranks at key
 // BROAD_FALLBACK_M + 0.1 * size, size = the polygon's footprint (placeFootprintM, not the radius
 // clamped to 300 km, so a state always beats its country) or radius_m without a shape, so a specific song within ~50 km plays first, then the
@@ -422,16 +424,42 @@ function placeDistanceFolk(lat, lon, place) {
   return [haversineM(lat, lon, place[3], place[4]), place[5], scope];
 }
 
+// The radius a place scores with: the corridor for a lined place, else radius_m.
+function placeRadiusM(place) {
+  const g = placeGeom(place);
+  return g === null ? place[5] : g[1];
+}
+
+// place_idx -> [distance_m, effective_radius_m] for places within the cutoff. Geometry (user
+// 2026-10-03: "Bring river and state outlines to hip-hop"): a lined place is 'specific', measured
+// to its nearest segment with the corridor as radius_m; a broad shaped place counts only inside
+// its polygon, at distance 0.
 function nearPlaces(lat, lon, places, mult, zoomMult = null) {
   const out = new Map();
   const zm = zoomMult === null || zoomMult === undefined ? mult : zoomMult;
-  places.forEach(([_pid, _name, ptype, plat, plon, radiusM], idx) => {
-    const scope = placeScope(ptype, radiusM);
+  places.forEach((place, idx) => {
+    const ptype = place[2], plat = place[3], plon = place[4];
+    const geom = placeGeom(place);
+    const radiusM = geom === null ? place[5] : geom[1];
+    const scope = geom === null ? placeScope(ptype, radiusM) : "specific";
     if (scope === "general") return;
     const r = radiusM * (scope === "broad" ? zm : mult);
     const reach = scope === "broad" ? r : CUTOFF_RADII * r;
-    if (!inBbox(lat, lon, plat, plon, reach)) return;
-    const d = haversineM(lat, lon, plat, plon);
+    let d;
+    if (geom !== null) {
+      if (!lineInBbox(lat, lon, geom[0], reach)) return;
+      d = lineDistanceM(lat, lon, geom[0]);
+    } else {
+      if (scope === "broad") {
+        const inside = insidePlaceShape(lat, lon, place);
+        if (inside !== null) {
+          if (inside) out.set(idx, [0.0, r]);
+          return;
+        }
+      }
+      if (!inBbox(lat, lon, plat, plon, reach)) return;
+      d = haversineM(lat, lon, plat, plon);
+    }
     if (d <= reach) out.set(idx, [d, r]);
   });
   return out;
@@ -536,7 +564,7 @@ function scoreSongs(lat, lon, mult, data, zoomMult = null) {
       if (hit === undefined) continue;
       const [d, r] = hit;
       const role = codes[roleCode];
-      const term = conf * weights[role] * gauss(d, r) * specificity(places[placeIdx][5]);
+      const term = conf * weights[role] * gauss(d, r) * specificity(placeRadiusM(places[placeIdx]));
       geo += term;
       if (term > best) best = term;
       why.push([term, { place: places[placeIdx][1], role, distance_m: Math.round(d) }]);
